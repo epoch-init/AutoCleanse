@@ -1,0 +1,9 @@
+# python files
+.venv/
+.env/
+venv/
+env/
+*.pyc
+
+# custom files
+test_videos/
