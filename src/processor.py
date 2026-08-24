@@ -16,12 +16,14 @@ class VideoProcessor:
         total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps
         
-        extract_distance = int(fps / self.config['fps'])
+        # INCREASE SENSITIVITY: 
+        # For a 1-second flash, we need to check at least 2 frames per second
+        extract_distance = max(1, int(fps / self.config['fps']))
         
         count = 0
         extracted_paths = []
         
-        print(f"Extracting frames at {self.config['fps']} FPS...")
+        print(f"Extracting frames (Processing 1 frame every {1/self.config['fps']:.1f}s)...")
         while True:
             success, image = vidcap.read()
             if not success:
@@ -46,11 +48,12 @@ class VideoProcessor:
         print(f"Analyzing {len(frames)} frames for explicit content...")
         for timestamp, path in frames:
             results = self.model_api.analyze_frame(path)
+            # Check if nudity score exceeds threshold
             is_explicit = any(score >= self.config['threshold'] for score in results.values())
 
             if is_explicit:
                 if active_scene is None:
-                    active_scene = {'start': timestamp, 'end': timestamp, 'label': 'nudity'}
+                    active_scene = {'start': timestamp, 'end': timestamp}
                 else:
                     active_scene['end'] = timestamp
             else:
@@ -62,11 +65,6 @@ class VideoProcessor:
             explicit_scenes.append(active_scene)
 
         processed_scenes = self.merge_and_pad_scenes(explicit_scenes)
-        
-        # Save metadata for transparency
-        with open("detection_log.json", "w+") as f:
-            json.dump(processed_scenes, f, indent=2)
-            
         return processed_scenes, duration
 
     def merge_and_pad_scenes(self, scenes):
@@ -75,6 +73,7 @@ class VideoProcessor:
         merged = []
         curr = scenes[0]
         for next_scene in scenes[1:]:
+            # If two explicit scenes are close together, join them
             if next_scene['start'] - curr['end'] < self.config['min_delta_between_splits']:
                 curr['end'] = next_scene['end']
             else:
@@ -90,7 +89,6 @@ class VideoProcessor:
         return scene
 
     def get_clean_segments(self, explicit_scenes, total_duration):
-        """Inverts explicit scenes to find the clean parts of the video."""
         clean_segments = []
         last_end = 0
 
@@ -111,7 +109,6 @@ class VideoProcessor:
             print("No clean scenes found. Entire video is flagged.")
             return
 
-        # Create a list file for ffmpeg concat
         concat_list = os.path.join(self.config['temp_dir'], "concat_list.txt")
         segment_files = []
 
@@ -120,7 +117,6 @@ class VideoProcessor:
             segment_path = os.path.join(self.config['temp_dir'], f"seg_{i}.mp4")
             duration = end - start
             
-            # FFmpeg command to cut
             codec = "libx264" if self.config['re_encode'] else "copy"
             cmd = [
                 'ffmpeg', '-y', '-ss', str(start), '-i', input_path,
@@ -132,7 +128,6 @@ class VideoProcessor:
         with open(concat_list, "w") as f:
             f.writelines(segment_files)
 
-        # Concatenate segments
         print("Stitching segments together...")
         concat_cmd = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
