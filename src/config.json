@@ -1,7 +1,9 @@
 {
   "padding": 1,
   "fps": 0.2,
-  "re-encode": false,
+  "re_encode": false,
   "threshold": 0.7,
-  "min_delta_between_splits": 30
+  "min_delta_between_splits": 30,
+  "temp_dir": "temp_frames",
+  "model_name": "default_nsfw_model"
 }
