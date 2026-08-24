@@ -1,65 +1,86 @@
 import os
 import torch
 from PIL import Image
-from transformers import AutoModelForImageClassification, AutoImageProcessor
+from transformers import CLIPProcessor, CLIPModel
 from .base import BaseModelAdapter
 
 class NsfwModelAdapter(BaseModelAdapter):
-    def __init__(self, threshold=0.3): # Lower threshold for cinematic sensitivity
+    def __init__(self, threshold=0.25): 
         self.threshold = threshold
         self.model = None
         self.processor = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Path to local model for 100% offline use
-        # On first run, it will download to cache. You can then copy that cache 
-        # to this path and it will never need internet again.
-        self.model_path = os.path.join(os.path.dirname(__file__), "../../weights/nsfw_vit")
-        self.model_name = "FalconsAI/nsfw_image_detection"
+        # Local paths for offline use
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.model_path = os.path.join(base_dir, "../../weights/clip-vit")
+        self.model_name = "openai/clip-vit-base-patch32"
+        
+        self.text_inputs = None
+        # These specific prompts help CLIP identify cinematic nudity vs clothing
+        self.labels = [
+            "a photo of people wearing clothes", 
+            "a photo of explicit nudity", 
+            "a photo of exposed breasts"
+        ]
 
     def load_model(self):
-        print(f"Loading High-Sensitivity ViT Model...")
+        print(f"Loading CLIP-ViT Model (Device: {self.device})...")
         
         load_path = self.model_path if os.path.exists(self.model_path) else self.model_name
         
-        self.processor = AutoImageProcessor.from_pretrained(load_path)
-        self.model = AutoModelForImageClassification.from_pretrained(load_path)
+        self.processor = CLIPProcessor.from_pretrained(load_path)
+        self.model = CLIPModel.from_pretrained(load_path)
         self.model.to(self.device)
         self.model.eval()
-        
-        # Save for future offline use if we just downloaded it
+
         if not os.path.exists(self.model_path):
-            print("Saving model locally for offline use...")
+            print("Downloading and saving weights for offline use...")
             os.makedirs(self.model_path, exist_ok=True)
             self.processor.save_pretrained(self.model_path)
             self.model.save_pretrained(self.model_path)
 
-    def _run_inference(self, pil_image):
-        inputs = self.processor(images=pil_image, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-            # Label 1 is usually the 'nsfw' or 'unsafe' class
-            return probs[0][1].item()
+        # Pre-tokenize text prompts
+        self.text_inputs = self.processor(
+            text=self.labels, 
+            return_tensors="pt", 
+            padding=True
+        ).to(self.device)
 
-    def predict(self, image_path: str) -> float:
-        full_img = Image.open(image_path).convert("RGB")
-        
-        # Scale 1: Full Frame
-        score_full = self._run_inference(full_img)
-        
-        # Scale 2: Center Crop (Helps with small subjects in cinematic shots)
-        w, h = full_img.size
-        # Crop the middle 60% of the image
-        left = w * 0.2
-        top = h * 0.2
-        right = w * 0.8
-        bottom = h * 0.8
-        crop_img = full_img.crop((left, top, right, bottom))
-        score_crop = self._run_inference(crop_img)
-        
-        # Return the higher of the two scores
-        return max(score_full, score_crop)
+    def predict(self, image_input) -> float:
+        """
+        Accepts a PIL Image. Uses CLIP's internal logit scaling for high accuracy.
+        """
+        if isinstance(image_input, str):
+            image = Image.open(image_input).convert("RGB")
+        else:
+            image = image_input
+
+        # Prepare inputs for the model
+        inputs = self.processor(
+            text=self.labels, 
+            images=image, 
+            return_tensors="pt", 
+            padding=True
+        ).to(self.device)
+
+        with torch.no_grad():
+            # Standard CLIP forward pass - most robust way to get logits
+            outputs = self.model(**inputs)
+            
+            # logits_per_image is the similarity score between the image and the 3 labels
+            logits_per_image = outputs.logits_per_image 
+            
+            # Convert to probabilities using softmax
+            probs = logits_per_image.softmax(dim=1)
+            
+            # probs[0][0] is 'clothed'
+            # probs[0][1] is 'nudity'
+            # probs[0][2] is 'exposed breasts'
+            # We sum the nudity-related probabilities
+            nsfw_score = probs[0][1].item() + probs[0][2].item()
+            
+        return nsfw_score
 
     def get_label(self) -> str:
         return "nudity"
