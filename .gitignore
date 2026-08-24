@@ -8,3 +8,4 @@ env/
 # custom files
 test_videos/
 *.zip
+*.mp4

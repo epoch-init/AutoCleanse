@@ -1,38 +1,45 @@
 import torch
-import torchvision.transforms as transforms
 from PIL import Image
+from transformers import AutoModelForImageClassification, AutoImageProcessor
 from .base import BaseModelAdapter
 
 class NsfwModelAdapter(BaseModelAdapter):
     def __init__(self, threshold=0.7):
         self.threshold = threshold
         self.model = None
+        self.processor = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        # High-quality, tiny NSFW model
+        self.model_name = "FalconsAI/nsfw_image_detection"
 
     def load_model(self):
-        # Using SqueezeNet as it's highly efficient for < 2GB VRAM
-        from torchvision.models import squeezenet1_1
-        self.model = squeezenet1_1(pretrained=True)
+        """Loads the model into VRAM."""
+        print(f"Loading NSFW model: {self.model_name} onto {self.device}...")
+        self.processor = AutoImageProcessor.from_pretrained(self.model_name)
+        self.model = AutoModelForImageClassification.from_pretrained(self.model_name)
         self.model.to(self.device)
         self.model.eval()
 
     def predict(self, image_path: str) -> float:
-        img = Image.open(image_path).convert('RGB')
-        img_t = self.transform(img)
-        batch_t = torch.unsqueeze(img_t, 0).to(self.device)
+        """
+        Predicts the probability of the image being NSFW.
+        The model returns two classes: 'normal' and 'nsfw'.
+        """
+        image = Image.open(image_path).convert("RGB")
+        
+        # Preprocess image
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
 
         with torch.no_grad():
-            out = self.model(batch_t)
-            # Standardizing output to a 0.0 - 1.0 probability
-            prob = torch.nn.functional.softmax(out, dim=1)
-            # In a real scenario, index 1 would be the 'NSFW' class
-            return prob[0][1].item() 
+            outputs = self.model(**inputs)
+            logits = outputs.logits
+            
+            # Model output labels: {0: 'normal', 1: 'nsfw'}
+            # We apply softmax to get probabilities
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            nsfw_score = probs[0][1].item()
+            
+        return nsfw_score
 
     def get_label(self) -> str:
         return "nudity"
