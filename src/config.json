@@ -1,8 +1,8 @@
 {
-  "padding": 1.5,
+  "padding": 2.5,
   "fps": 2.0,
   "re_encode": false,
-  "threshold": 0.35,
-  "min_delta_between_splits": 5,
+  "threshold": 0.65,
+  "min_delta_between_splits": 10,
   "temp_dir": "temp_frames"
 }

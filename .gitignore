@@ -11,3 +11,4 @@ test_videos/
 *.mp4
 *.png
 *.pt
+*.safetensors

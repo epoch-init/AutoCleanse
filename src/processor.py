@@ -44,16 +44,29 @@ class VideoProcessor:
         frames, duration = self.extract_frames(video_path)
         explicit_scenes = []
         active_scene = None
+        
+        # BUFFER FOR SENSITIVITY
+        # We track the last 3 scores. If the average is high, we cut.
+        score_buffer = []
 
-        print(f"Analyzing {len(frames)} frames for explicit content...")
+        print(f"Analyzing {len(frames)} frames with High-Sensitivity Logic...")
         for timestamp, path in frames:
             results = self.model_api.analyze_frame(path)
-            # Check if nudity score exceeds threshold
-            is_explicit = any(score >= self.config['threshold'] for score in results.values())
+            score = max(results.values())
+            
+            score_buffer.append(score)
+            if len(score_buffer) > 3:
+                score_buffer.pop(0)
+            
+            avg_score = sum(score_buffer) / len(score_buffer)
+            
+            # TRIGGER: Either a massive spike (>0.7) or sustained suspicion (>0.35 for 3 frames)
+            is_explicit = score > 0.7 or (len(score_buffer) == 3 and avg_score > self.config['threshold'])
 
             if is_explicit:
                 if active_scene is None:
                     active_scene = {'start': timestamp, 'end': timestamp}
+                    print(f"  [!] Flagged scene start at {timestamp:.2f}s (Score: {score:.2f})")
                 else:
                     active_scene['end'] = timestamp
             else:
@@ -66,7 +79,7 @@ class VideoProcessor:
 
         processed_scenes = self.merge_and_pad_scenes(explicit_scenes)
         return processed_scenes, duration
-
+    
     def merge_and_pad_scenes(self, scenes):
         if not scenes: return []
         
