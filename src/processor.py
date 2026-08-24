@@ -64,7 +64,7 @@ class VideoProcessor:
         processed_scenes = self.merge_and_pad_scenes(explicit_scenes)
         
         # Save metadata for transparency
-        with open("detection_log.json", "w") as f:
+        with open("detection_log.json", "w+") as f:
             json.dump(processed_scenes, f, indent=2)
             
         return processed_scenes, duration
