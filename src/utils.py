@@ -3,7 +3,10 @@ import os
 import shutil
 
 def get_config():
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    # Gets the directory where utils.py is located
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(base_path, "config.json")
+    
     with open(config_path, "r") as f:
         return json.load(f)
 
