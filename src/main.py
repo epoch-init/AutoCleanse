@@ -1,6 +1,8 @@
 import argparse
 from utils import get_config
 from processor import VideoProcessor
+from models.adapter_api import ModelInterface
+from models.nsfw_model import NsfwModelAdapter
 
 def main():
     parser = argparse.ArgumentParser(description="AutoCleanse: Automatic NSFW Scene Remover")
@@ -10,13 +12,21 @@ def main():
     args = parser.parse_args()
     config = get_config()
 
-    print(f"--- AutoCleanse Starting ---")
-    print(f"Input: {args.input}")
-    print(f"Config: {config}")
+    # Initialize Model
+    nsfw_adapter = NsfwModelAdapter(threshold=config['threshold'])
+    nsfw_adapter.load_model()
+    
+    # Initialize API and Processor
+    model_api = ModelInterface([nsfw_adapter])
+    processor = VideoProcessor(config, model_api)
 
-    # Logic will be implemented in Phase 2/3
-    # processor = VideoProcessor(config)
-    # processor.process(args.input, args.output)
+    print(f"--- AutoCleanse Started ---")
+    
+    # Step 1: Analyze
+    explicit_scenes, duration = processor.analyze_video(args.input)
+    
+    # Step 2: Cut and Stitch
+    processor.cut_video(args.input, args.output, explicit_scenes, duration)
 
 if __name__ == '__main__':
     main()
