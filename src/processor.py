@@ -14,38 +14,42 @@ class VideoProcessor:
         fps = vidcap.get(cv2.CAP_PROP_FPS)
         total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps
-        
-        # Extract frames based on config FPS (e.g. 2.0 means every 0.5s)
         extract_distance = max(1, int(fps / self.config['fps']))
         
         explicit_scenes = []
         active_scene = None
-        count = 0
-
-        print(f"--- AutoCleanse: Scanning {os.path.basename(video_path)} ---")
         
+        # SMOOTHING BUFFER: Requires 3 consecutive hits to trigger
+        buffer = []
+        buffer_size = 3 
+
+        print(f"--- Scanning: {os.path.basename(video_path)} (Smoothing Enabled) ---")
+        
+        count = 0
         while True:
             success, frame = vidcap.read()
-            if not success:
-                break
+            if not success: break
             
             if count % extract_distance == 0:
                 timestamp = count / fps
-                
-                # Faster: Convert OpenCV BGR to RGB and then to PIL in RAM
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(frame_rgb)
 
-                # Send PIL image directly to CLIP
                 results = self.model_api.analyze_frame(pil_img)
                 score = max(results.values())
                 
-                is_explicit = score >= self.config['threshold']
+                # Check if current frame is suspicious
+                is_hit = score >= self.config['threshold']
+                buffer.append(is_hit)
+                if len(buffer) > buffer_size: buffer.pop(0)
+
+                # TRIGGER LOGIC: True only if the majority of the buffer is True
+                is_explicit = sum(buffer) >= 2 
 
                 if is_explicit:
                     if active_scene is None:
                         active_scene = {'start': timestamp, 'end': timestamp}
-                        print(f"  [!] Flagged: {timestamp:.2f}s (Score: {score:.2f})")
+                        print(f"  [!] NSFW Scene Started: {timestamp:.2f}s")
                     else:
                         active_scene['end'] = timestamp
                 else:
@@ -58,11 +62,9 @@ class VideoProcessor:
                 print(f"  Progress: {(count/total_frames)*100:.1f}%", end="\r")
 
         vidcap.release()
-        if active_scene:
-            explicit_scenes.append(active_scene)
+        if active_scene: explicit_scenes.append(active_scene)
 
-        processed_scenes = self.merge_and_pad_scenes(explicit_scenes)
-        return processed_scenes, duration
+        return self.merge_and_pad_scenes(explicit_scenes), duration
 
     def merge_and_pad_scenes(self, scenes):
         if not scenes: return []
@@ -83,7 +85,6 @@ class VideoProcessor:
         return scene
 
     def cut_video(self, input_path, output_path, explicit_scenes, total_duration):
-        # We find the clean segments (inverted NSFW scenes)
         clean_segments = []
         last_end = 0
         for scene in explicit_scenes:
@@ -101,12 +102,11 @@ class VideoProcessor:
         concat_list = os.path.join(self.config['temp_dir'], "concat_list.txt")
         segment_files = []
 
-        print(f"\nStitching {len(clean_segments)} clean segments together...")
+        print(f"\nCreating clean version...")
         for i, (start, end) in enumerate(clean_segments):
             segment_path = os.path.join(self.config['temp_dir'], f"seg_{i}.mp4")
             duration = end - start
             codec = "libx264" if self.config['re_encode'] else "copy"
-            
             cmd = [
                 'ffmpeg', '-y', '-ss', str(start), '-i', input_path,
                 '-t', str(duration), '-c', codec, '-avoid_negative_ts', '1', segment_path
@@ -117,10 +117,6 @@ class VideoProcessor:
         with open(concat_list, "w") as f:
             f.writelines(segment_files)
 
-        final_cmd = [
-            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
-            '-c', 'copy', output_path
-        ]
-        subprocess.run(final_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list, '-c', 'copy', output_path], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         cleanup_temp_dir(self.config['temp_dir'])
-        print(f"--- Clean video created: {output_path} ---")
+        print(f"--- Clean video: {output_path} ---")
