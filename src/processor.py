@@ -8,6 +8,7 @@ class VideoProcessor:
     def __init__(self, config, model_interface):
         self.config = config
         self.model_api = model_interface
+        self.batch_size = 12 # Optimized for 2GB VRAM
 
     def analyze_video(self, video_path):
         vidcap = cv2.VideoCapture(video_path)
@@ -19,55 +20,89 @@ class VideoProcessor:
         explicit_scenes = []
         active_scene = None
         
-        # SMOOTHING BUFFER: Requires 3 consecutive hits to trigger
-        buffer = []
-        buffer_size = 3 
-
-        print(f"--- Scanning: {os.path.basename(video_path)} (Smoothing Enabled) ---")
+        # Smoothing
+        score_history = []
+        
+        print(f"--- Fast Scan: {os.path.basename(video_path)} ---")
         
         count = 0
+        batch_frames = []
+        batch_timestamps = []
+
         while True:
             success, frame = vidcap.read()
             if not success: break
             
             if count % extract_distance == 0:
                 timestamp = count / fps
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame_rgb)
-
-                results = self.model_api.analyze_frame(pil_img)
-                score = max(results.values())
                 
-                # Check if current frame is suspicious
-                is_hit = score >= self.config['threshold']
-                buffer.append(is_hit)
-                if len(buffer) > buffer_size: buffer.pop(0)
+                # Fast Resize before PIL conversion
+                small_frame = cv2.resize(frame, (224, 224))
+                frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                batch_frames.append(Image.fromarray(frame_rgb))
+                batch_timestamps.append(timestamp)
 
-                # TRIGGER LOGIC: True only if the majority of the buffer is True
-                is_explicit = sum(buffer) >= 2 
+                # Process batch when full
+                if len(batch_frames) >= self.batch_size:
+                    self._process_batch(batch_frames, batch_timestamps, score_history, explicit_scenes, active_scene)
+                    # Note: active_scene is passed by reference, but we need to track it
+                    if explicit_scenes and active_scene == explicit_scenes[-1]:
+                        active_scene = explicit_scenes[-1]
+                    
+                    # Update local state tracker
+                    if active_scene and (not explicit_scenes or active_scene != explicit_scenes[-1]):
+                        pass # scene still active
+                    elif explicit_scenes and not active_scene:
+                        pass # scene just ended
 
-                if is_explicit:
-                    if active_scene is None:
-                        active_scene = {'start': timestamp, 'end': timestamp}
-                        print(f"  [!] NSFW Scene Started: {timestamp:.2f}s")
-                    else:
-                        active_scene['end'] = timestamp
-                else:
-                    if active_scene is not None:
-                        explicit_scenes.append(active_scene)
-                        active_scene = None
+                    batch_frames = []
+                    batch_timestamps = []
 
             count += 1
             if count % (extract_distance * 10) == 0:
                 print(f"  Progress: {(count/total_frames)*100:.1f}%", end="\r")
 
-        vidcap.release()
-        if active_scene: explicit_scenes.append(active_scene)
+        # Process remaining
+        if batch_frames:
+            self._process_batch(batch_frames, batch_timestamps, score_history, explicit_scenes, active_scene)
 
-        return self.merge_and_pad_scenes(explicit_scenes), duration
+        vidcap.release()
+        
+        # Cleanup logic for final scene
+        final_scenes = self.merge_and_pad_scenes(explicit_scenes)
+        return final_scenes, duration
+
+    def _process_batch(self, frames, timestamps, history, explicit_list, active_ref):
+        # We access the model's batch predictor via the unified API
+        # For simplicity, we directly call nsfw_model here or through interface
+        adapter = self.model_api.adapters[0] 
+        scores = adapter.predict_batch(frames)
+
+        for i, score in enumerate(scores):
+            t = timestamps[i]
+            history.append(score)
+            if len(history) > 5: history.pop(0)
+            
+            avg_score = sum(history) / len(history)
+            
+            # Weighted Decision
+            is_explicit = avg_score >= self.config['threshold']
+
+            # Update the explicit_list directly
+            if is_explicit:
+                if not explicit_list or 'ended' in explicit_list[-1]:
+                    explicit_list.append({'start': t, 'end': t})
+                else:
+                    explicit_list[-1]['end'] = t
+            else:
+                if explicit_list and 'ended' not in explicit_list[-1]:
+                    explicit_list[-1]['ended'] = True # Mark as finished
 
     def merge_and_pad_scenes(self, scenes):
         if not scenes: return []
+        # Remove the 'ended' helper flag
+        for s in scenes: s.pop('ended', None)
+        
         merged = []
         curr = scenes[0]
         for next_scene in scenes[1:]:
@@ -94,29 +129,19 @@ class VideoProcessor:
         if last_end < total_duration:
             clean_segments.append((last_end, total_duration))
 
-        if not clean_segments:
-            print("No clean scenes found.")
-            return
-
+        if not clean_segments: return
         setup_temp_dir(self.config['temp_dir'])
         concat_list = os.path.join(self.config['temp_dir'], "concat_list.txt")
         segment_files = []
 
-        print(f"\nCreating clean version...")
+        print(f"\nFinal Stitching...")
         for i, (start, end) in enumerate(clean_segments):
             segment_path = os.path.join(self.config['temp_dir'], f"seg_{i}.mp4")
-            duration = end - start
-            codec = "libx264" if self.config['re_encode'] else "copy"
-            cmd = [
-                'ffmpeg', '-y', '-ss', str(start), '-i', input_path,
-                '-t', str(duration), '-c', codec, '-avoid_negative_ts', '1', segment_path
-            ]
+            cmd = ['ffmpeg', '-y', '-ss', str(start), '-i', input_path, '-t', str(end-start), '-c', 'copy', '-avoid_negative_ts', '1', segment_path]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             segment_files.append(f"file '{os.path.abspath(segment_path)}'\n")
 
-        with open(concat_list, "w") as f:
-            f.writelines(segment_files)
-
+        with open(concat_list, "w") as f: f.writelines(segment_files)
         subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list, '-c', 'copy', output_path], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         cleanup_temp_dir(self.config['temp_dir'])
-        print(f"--- Clean video: {output_path} ---")
+        print(f"--- Processed Video Saved: {output_path} ---")
