@@ -8,6 +8,7 @@ class VideoProcessor:
     def __init__(self, config, model_interface):
         self.config = config
         self.model_api = model_interface
+        self.batch_size = 16 # Process 16 frames simultaneously (Fits easily in 2GB VRAM)
 
     def analyze_video(self, video_path):
         vidcap = cv2.VideoCapture(video_path)
@@ -19,52 +20,84 @@ class VideoProcessor:
         explicit_scenes = []
         active_scene = None
         
-        # SMOOTHING BUFFER: Requires 3 consecutive hits to trigger
         buffer = []
         buffer_size = 3 
 
-        print(f"--- Scanning: {os.path.basename(video_path)} (Smoothing Enabled) ---")
+        print(f"--- Fast Scanning: {os.path.basename(video_path)} ---")
         
-        count = 0
+        batch_images = []
+        batch_timestamps = []
+        processed_count = 0
+
         while True:
-            success, frame = vidcap.read()
-            if not success: break
-            
-            if count % extract_distance == 0:
-                timestamp = count / fps
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame_rgb)
-
-                results = self.model_api.analyze_frame(pil_img)
-                score = max(results.values())
+            # FAST SKIP: grab() skips the expensive decoding phase for frames we ignore
+            for _ in range(extract_distance - 1):
+                vidcap.grab()
+                processed_count += 1
                 
-                # Check if current frame is suspicious
-                is_hit = score >= self.config['threshold']
-                buffer.append(is_hit)
-                if len(buffer) > buffer_size: buffer.pop(0)
+            # Actually read and decode the target frame
+            success, frame = vidcap.read()
+            processed_count += 1
+            
+            if not success: 
+                break
+                
+            timestamp = processed_count / fps
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            batch_images.append(Image.fromarray(frame_rgb))
+            batch_timestamps.append(timestamp)
 
-                # TRIGGER LOGIC: True only if the majority of the buffer is True
-                is_explicit = sum(buffer) >= 2 
+            # If batch is full, send to GPU
+            if len(batch_images) == self.batch_size:
+                explicit_scenes, active_scene, buffer = self._process_batch(
+                    batch_images, batch_timestamps, buffer, buffer_size, 
+                    explicit_scenes, active_scene
+                )
+                # Clear batch
+                batch_images = []
+                batch_timestamps = []
+                
+                print(f"  Progress: {(processed_count/total_frames)*100:.1f}%", end="\r")
 
-                if is_explicit:
-                    if active_scene is None:
-                        active_scene = {'start': timestamp, 'end': timestamp}
-                        print(f"  [!] NSFW Scene Started: {timestamp:.2f}s")
-                    else:
-                        active_scene['end'] = timestamp
-                else:
-                    if active_scene is not None:
-                        explicit_scenes.append(active_scene)
-                        active_scene = None
-
-            count += 1
-            if count % (extract_distance * 10) == 0:
-                print(f"  Progress: {(count/total_frames)*100:.1f}%", end="\r")
+        # Process any remaining frames in the final partial batch
+        if batch_images:
+            explicit_scenes, active_scene, buffer = self._process_batch(
+                batch_images, batch_timestamps, buffer, buffer_size, 
+                explicit_scenes, active_scene
+            )
 
         vidcap.release()
         if active_scene: explicit_scenes.append(active_scene)
 
+        print("\n--- Scan Complete ---")
         return self.merge_and_pad_scenes(explicit_scenes), duration
+
+    def _process_batch(self, images, timestamps, buffer, buffer_size, explicit_scenes, active_scene):
+        """Helper method to process a batch and update state variables."""
+        batch_results = self.model_api.analyze_batch(images)
+        
+        for i, results in enumerate(batch_results):
+            score = max(results.values())
+            timestamp = timestamps[i]
+            
+            is_hit = score >= self.config['threshold']
+            buffer.append(is_hit)
+            if len(buffer) > buffer_size: buffer.pop(0)
+
+            is_explicit = sum(buffer) >= 2 
+
+            if is_explicit:
+                if active_scene is None:
+                    active_scene = {'start': timestamp, 'end': timestamp}
+                    print(f"  [!] NSFW Scene Started: {timestamp:.2f}s (Score: {score:.2f})")
+                else:
+                    active_scene['end'] = timestamp
+            else:
+                if active_scene is not None:
+                    explicit_scenes.append(active_scene)
+                    active_scene = None
+                    
+        return explicit_scenes, active_scene, buffer
 
     def merge_and_pad_scenes(self, scenes):
         if not scenes: return []
