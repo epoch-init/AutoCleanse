@@ -4,6 +4,7 @@
 venv/
 env/
 *.pyc
+*.log
 
 # custom files
 test_videos/
@@ -12,3 +13,4 @@ test_videos/
 *.png
 *.pt
 *.safetensors
+sample*
