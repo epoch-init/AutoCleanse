@@ -3,6 +3,7 @@ import os
 import subprocess
 import json
 import re
+import concurrent.futures
 from PIL import Image
 from utils import setup_temp_dir, cleanup_temp_dir
 
@@ -121,22 +122,26 @@ class VideoProcessor:
             clean_segments.append((last_end, total_duration))
         return clean_segments
 
-    def get_actual_duration(self, file_path):
-        """Uses ffprobe to get the EXACT duration of the generated video segment."""
+    def _extract_and_measure(self, args):
+        """Worker function to run FFmpeg and instantly read actual duration in parallel."""
+        idx, start, end, input_path, segment_path, codec = args
+        requested_duration = end - start
+        
         cmd = [
-            'ffprobe', '-v', 'error', '-show_entries', 
-            'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path
+            'ffmpeg', '-y', '-ss', str(start), '-i', input_path,
+            '-t', str(requested_duration), '-c', codec, '-avoid_negative_ts', '1', segment_path
         ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            return float(result.stdout.strip())
-        except ValueError:
-            # Fallback to OpenCV if ffprobe fails
-            cap = cv2.VideoCapture(file_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            cap.release()
-            return frames / fps if fps > 0 else 0
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        
+        # Instant Header Read (Avoids ffprobe process overhead and frame scanning)
+        cap = cv2.VideoCapture(segment_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        
+        if fps > 0 and frames > 0:
+            return frames / fps
+        return requested_duration # Fallback to requested if metadata is missing
 
     def cut_video(self, input_path, output_path, explicit_scenes, total_duration):
         clean_segments = self.get_clean_segments(explicit_scenes, total_duration)
@@ -149,35 +154,36 @@ class VideoProcessor:
         concat_list = os.path.join(self.config['temp_dir'], "concat_list.txt")
         segment_files = []
         
-        # We will store the actual durations of the cuts here to perfectly sync SRT later
-        actual_segments = []
+        actual_segments = [None] * len(clean_segments)
+        codec = "libx264" if self.config['re_encode'] else "copy"
 
-        print(f"\nCreating clean version...")
+        print(f"\nExtracting {len(clean_segments)} clean segments (Parallel Mode)...")
+        
+        # Prepare arguments for parallel execution
+        tasks = []
         for i, (start, end) in enumerate(clean_segments):
             segment_path = os.path.join(self.config['temp_dir'], f"seg_{i}.mp4")
-            requested_duration = end - start
-            codec = "libx264" if self.config['re_encode'] else "copy"
-            
-            cmd = [
-                'ffmpeg', '-y', '-ss', str(start), '-i', input_path,
-                '-t', str(requested_duration), '-c', codec, '-avoid_negative_ts', '1', segment_path
-            ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            
-            # Find out what FFmpeg ACTUALLY did (due to keyframe snapping)
-            actual_duration = self.get_actual_duration(segment_path)
-            
-            actual_segments.append({
-                'original_start': start,
-                'original_end': end,
-                'actual_duration': actual_duration
-            })
-            
+            tasks.append((i, start, end, input_path, segment_path, codec))
             segment_files.append(f"file '{os.path.abspath(segment_path)}'\n")
 
+        # Execute extractions simultaneously using all available CPU threads
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_idx = {executor.submit(self._extract_and_measure, task): task[0] for task in tasks}
+            
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                actual_dur = future.result()
+                actual_segments[idx] = {
+                    'original_start': clean_segments[idx][0],
+                    'original_end': clean_segments[idx][1],
+                    'actual_duration': actual_dur
+                }
+
+        # Write concat list in order
         with open(concat_list, "w") as f:
             f.writelines(segment_files)
 
+        print("Stitching segments together...")
         subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list, '-c', 'copy', output_path], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         cleanup_temp_dir(self.config['temp_dir'])
         print(f"--- Clean video: {output_path} ---")
@@ -208,9 +214,7 @@ class VideoProcessor:
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     def map_time(self, t, actual_segments):
-        """Maps an original timestamp using the verified actual FFmpeg cut durations."""
         accumulated_new_time = 0.0
-        
         for seg in actual_segments:
             seg_start = seg['original_start']
             seg_end = seg['original_end']
@@ -220,16 +224,13 @@ class VideoProcessor:
                 return accumulated_new_time
                 
             if seg_start <= t <= seg_end:
-                # The subtitle falls within this segment. We add its offset from the segment start.
                 offset_in_seg = t - seg_start
-                # Scale it slightly if keyframes warped the duration significantly (safeguard)
                 theoretical_dur = seg_end - seg_start
                 if theoretical_dur > 0:
                     scale_factor = actual_dur / theoretical_dur
                     return accumulated_new_time + (offset_in_seg * scale_factor)
                 return accumulated_new_time + offset_in_seg
                 
-            # If the subtitle is past this segment, we add the ENTIRE actual duration of this cut
             accumulated_new_time += actual_dur
             
         return accumulated_new_time
@@ -257,11 +258,9 @@ class VideoProcessor:
                 end_t = self.parse_srt_time(end_str.strip())
                 text = '\n'.join(lines[2:])
                 
-                # Remap using ACTUAL durations
                 new_start = self.map_time(start_t, actual_segments)
                 new_end = self.map_time(end_t, actual_segments)
                 
-                # If the subtitle spans less than 100ms in the new timeline, it was inside an explicit cut
                 if new_end - new_start > 0.1:
                     new_blocks.append(f"{sub_idx}\n{self.format_srt_time(new_start)} --> {self.format_srt_time(new_end)}\n{text}")
                     sub_idx += 1
