@@ -121,27 +121,58 @@ class VideoProcessor:
             clean_segments.append((last_end, total_duration))
         return clean_segments
 
+    def get_actual_duration(self, file_path):
+        """Uses ffprobe to get the EXACT duration of the generated video segment."""
+        cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 
+            'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            return float(result.stdout.strip())
+        except ValueError:
+            # Fallback to OpenCV if ffprobe fails
+            cap = cv2.VideoCapture(file_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            return frames / fps if fps > 0 else 0
+
     def cut_video(self, input_path, output_path, explicit_scenes, total_duration):
         clean_segments = self.get_clean_segments(explicit_scenes, total_duration)
 
         if not clean_segments:
             print("No clean scenes found.")
-            return clean_segments
+            return []
 
         setup_temp_dir(self.config['temp_dir'])
         concat_list = os.path.join(self.config['temp_dir'], "concat_list.txt")
         segment_files = []
+        
+        # We will store the actual durations of the cuts here to perfectly sync SRT later
+        actual_segments = []
 
         print(f"\nCreating clean version...")
         for i, (start, end) in enumerate(clean_segments):
             segment_path = os.path.join(self.config['temp_dir'], f"seg_{i}.mp4")
-            duration = end - start
+            requested_duration = end - start
             codec = "libx264" if self.config['re_encode'] else "copy"
+            
             cmd = [
                 'ffmpeg', '-y', '-ss', str(start), '-i', input_path,
-                '-t', str(duration), '-c', codec, '-avoid_negative_ts', '1', segment_path
+                '-t', str(requested_duration), '-c', codec, '-avoid_negative_ts', '1', segment_path
             ]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            
+            # Find out what FFmpeg ACTUALLY did (due to keyframe snapping)
+            actual_duration = self.get_actual_duration(segment_path)
+            
+            actual_segments.append({
+                'original_start': start,
+                'original_end': end,
+                'actual_duration': actual_duration
+            })
+            
             segment_files.append(f"file '{os.path.abspath(segment_path)}'\n")
 
         with open(concat_list, "w") as f:
@@ -151,7 +182,7 @@ class VideoProcessor:
         cleanup_temp_dir(self.config['temp_dir'])
         print(f"--- Clean video: {output_path} ---")
         
-        return clean_segments
+        return actual_segments
 
     # --- SRT & Logging Utilities ---
     
@@ -176,18 +207,34 @@ class VideoProcessor:
             m = m % 60
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    def map_time(self, t, clean_segments):
-        """Maps an original timestamp to the new shortened timeline."""
-        accumulated = 0.0
-        for (seg_start, seg_end) in clean_segments:
+    def map_time(self, t, actual_segments):
+        """Maps an original timestamp using the verified actual FFmpeg cut durations."""
+        accumulated_new_time = 0.0
+        
+        for seg in actual_segments:
+            seg_start = seg['original_start']
+            seg_end = seg['original_end']
+            actual_dur = seg['actual_duration']
+            
             if t < seg_start:
-                return accumulated
+                return accumulated_new_time
+                
             if seg_start <= t <= seg_end:
-                return accumulated + (t - seg_start)
-            accumulated += (seg_end - seg_start)
-        return accumulated
+                # The subtitle falls within this segment. We add its offset from the segment start.
+                offset_in_seg = t - seg_start
+                # Scale it slightly if keyframes warped the duration significantly (safeguard)
+                theoretical_dur = seg_end - seg_start
+                if theoretical_dur > 0:
+                    scale_factor = actual_dur / theoretical_dur
+                    return accumulated_new_time + (offset_in_seg * scale_factor)
+                return accumulated_new_time + offset_in_seg
+                
+            # If the subtitle is past this segment, we add the ENTIRE actual duration of this cut
+            accumulated_new_time += actual_dur
+            
+        return accumulated_new_time
 
-    def sync_srt(self, srt_path, output_srt_path, clean_segments):
+    def sync_srt(self, srt_path, output_srt_path, actual_segments):
         if not os.path.exists(srt_path):
             print(f"Error: SRT file not found at {srt_path}")
             return
@@ -210,11 +257,11 @@ class VideoProcessor:
                 end_t = self.parse_srt_time(end_str.strip())
                 text = '\n'.join(lines[2:])
                 
-                # Remap times
-                new_start = self.map_time(start_t, clean_segments)
-                new_end = self.map_time(end_t, clean_segments)
+                # Remap using ACTUAL durations
+                new_start = self.map_time(start_t, actual_segments)
+                new_end = self.map_time(end_t, actual_segments)
                 
-                # If the subtitle spans less than 100ms in the new timeline, it was cut
+                # If the subtitle spans less than 100ms in the new timeline, it was inside an explicit cut
                 if new_end - new_start > 0.1:
                     new_blocks.append(f"{sub_idx}\n{self.format_srt_time(new_start)} --> {self.format_srt_time(new_end)}\n{text}")
                     sub_idx += 1
